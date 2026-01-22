@@ -49,6 +49,9 @@ spec:
         runAsGroup: 1001
         fsGroup: 1001
         fsGroupChangePolicy: "OnRootMismatch"
+      {{- if .Values.engine.shareProcessNamespace }}
+      shareProcessNamespace: true
+      {{- end }}
       serviceAccountName: {{ include "dagger.serviceAccountName" . }}
       {{- if .Values.engine.priorityClassName }}
       priorityClassName: {{ .Values.engine.priorityClassName }}
@@ -130,6 +133,16 @@ spec:
                   dagger core version
             {{- if .Values.engine.readinessProbeSettings }}
             {{- toYaml .Values.engine.readinessProbeSettings | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -exc
+                - |-
+                  dagger core version
+            {{- if .Values.engine.livenessProbeSettings }}
+            {{- toYaml .Values.engine.livenessProbeSettings | nindent 12 }}
             {{- end }}
           {{- if .Values.engine.lifecycle }}
           lifecycle:

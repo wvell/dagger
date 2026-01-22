@@ -49,7 +49,7 @@ func (s *fileSchema) Install(srv *dagql.Server) {
 			Args(
 				dagql.Arg("excludeMetadata").Doc(`If true, exclude metadata from the digest.`),
 			),
-		dagql.Func("withName", s.withName).
+		dagql.NodeFunc("withName", DagOpFileWrapper(srv, s.withName, WithPathFn(fileWithNamePath))).
 			Doc(`Retrieves this file with its name set to the given name.`).
 			Args(
 				dagql.Arg("name").Doc(`Name to set file to.`),
@@ -134,7 +134,7 @@ func (s *fileSchema) size(ctx context.Context, file *core.File, args struct{}) (
 		return 0, err
 	}
 
-	return dagql.NewInt(int(info.Size_)), nil
+	return dagql.NewInt(info.Size), nil
 }
 
 func (s *fileSchema) name(ctx context.Context, file *core.File, args struct{}) (dagql.String, error) {
@@ -142,11 +142,7 @@ func (s *fileSchema) name(ctx context.Context, file *core.File, args struct{}) (
 }
 
 func (s *fileSchema) stat(ctx context.Context, parent *core.File, args struct{}) (*core.Stat, error) {
-	srv, err := core.CurrentDagqlServer(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return parent.StatDagOp(ctx, srv)
+	return parent.Stat(ctx)
 }
 
 type fileDigestArgs struct {
@@ -164,10 +160,26 @@ func (s *fileSchema) digest(ctx context.Context, file *core.File, args fileDiges
 
 type fileWithNameArgs struct {
 	Name string
+
+	FSDagOpInternalArgs
 }
 
-func (s *fileSchema) withName(ctx context.Context, parent *core.File, args fileWithNameArgs) (*core.File, error) {
-	return parent.WithName(ctx, args.Name)
+func fileWithNamePath(ctx context.Context, val *core.File, args fileWithNameArgs) (string, error) {
+	return args.Name, nil
+}
+
+func (s *fileSchema) withName(ctx context.Context, parent dagql.ObjectResult[*core.File], args fileWithNameArgs) (inst dagql.ObjectResult[*core.File], err error) {
+	srv, err := core.CurrentDagqlServer(ctx)
+	if err != nil {
+		return inst, err
+	}
+
+	file, err := parent.Self().WithName(ctx, args.Name)
+	if err != nil {
+		return inst, err
+	}
+
+	return dagql.NewObjectResultForCurrentID(ctx, srv, file)
 }
 
 type fileExportArgs struct {

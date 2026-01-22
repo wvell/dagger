@@ -1,6 +1,6 @@
 {
   "name": "dagger-dev",
-  "engineVersion": "v0.19.8",
+  "engineVersion": "v0.19.10",
   "sdk": {
     "source": "go"
   },
@@ -32,33 +32,8 @@
     {
       "name": "go",
       "source": "toolchains/go",
-      "arguments": [
-        {
-          "name": "source",
-          "argument": "",
-          "ignore": [
-            "bin",
-            ".git",
-            "**/node_modules",
-            "**/.venv",
-            "**/__pycache__",
-            "**/sdk/runtime/**",
-            "docs/node_modules",
-            "sdk/typescript/node_modules",
-            "sdk/typescript/dist",
-            "sdk/rust/examples/backend/target",
-            "sdk/rust/target",
-            "sdk/php/vendor",
-            "docs/**",
-            "dagql/idtui/viztest/broken/**",
-            "modules/evals/**",
-            "**/broken*/**"
-          ]
-        }
-      ],
       "customizations": [
         {
-          "name": "",
           "argument": "source",
           "ignore": [
             "bin",
@@ -76,7 +51,8 @@
             "docs/**",
             "dagql/idtui/viztest/broken/**",
             "modules/evals/**",
-            "**/broken*/**"
+            "**/broken*/**",
+            "core/integration/testdata/checks/hello-with-checks/"
           ]
         }
       ]
@@ -120,30 +96,11 @@
     {
       "name": "security",
       "source": "toolchains/security",
-      "arguments": [
-        {
-          "function": [
-            "scanSource"
-          ],
-          "name": "source",
-          "argument": "",
-          "ignore": [
-            "bin",
-            ".git",
-            "docs",
-            "sdk/rust/examples",
-            "sdk/rust/crates/dagger-sdk/examples",
-            "core/integration/testdata",
-            "dagql/idtui/viztest"
-          ]
-        }
-      ],
       "customizations": [
         {
           "function": [
             "scanSource"
           ],
-          "name": "",
           "argument": "source",
           "ignore": [
             "bin",

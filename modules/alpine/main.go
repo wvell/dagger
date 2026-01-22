@@ -37,6 +37,12 @@ func New(
 	// APK packages to install
 	// +optional
 	packages []string,
+	// Extra repositories to add to the package resolver
+	// +optional
+	extraRepositories []string,
+	// Extra keys needed to authenticate the extra repositories
+	// +optional
+	extraKeyURLs []string,
 
 	// Alpine distribution to use
 	// +optional
@@ -64,10 +70,12 @@ func New(
 	}
 
 	return Alpine{
-		Distro:   distro,
-		Branch:   branch,
-		Arch:     arch,
-		Packages: packages,
+		Distro:            distro,
+		Branch:            branch,
+		Arch:              arch,
+		Packages:          packages,
+		ExtraRepositories: extraRepositories,
+		ExtraKeyURLs:      extraKeyURLs,
 
 		GoArch: goArch,
 	}, nil
@@ -83,6 +91,10 @@ type Alpine struct {
 	Branch string
 	// The APK packages to install
 	Packages []string
+	// Extra repositories to add to the package resolver
+	ExtraRepositories []string
+	// Where to download additional keys from
+	ExtraKeyURLs []string
 
 	// the GOARCH equivalent of Arch
 	// +private
@@ -120,23 +132,18 @@ func (m *Alpine) Container(ctx context.Context) (*dagger.Container, error) {
 		repos = wolfiRepositories()
 
 		basePkgs = []string{
-			// HACK: Wolfi will occasionally publish APKINDEX files that are missing required
-			// versions of glibc and related packages. This is a problem when one of them, like
-			// ld-linux, specifies a dependency on an exact version that is not present.
-			// This resolves itself usually within an hour, but to avoid fundamental breakage of
-			// builds we are currently pinning these packages for now.
-			"busybox=1.37.0-r49",
-			"glibc=2.42-r0",
-			"ld-linux=2.42-r0",
-			"libcrypt1=2.42-r0",
+			"busybox",
 		}
 	default:
 		return nil, fmt.Errorf("unknown distro %q", m.Distro)
 	}
 
-	keys, err := fetchKeys(*branch, m.Arch)
+	keys, err := fetchKeys(*branch, m.Arch, m.ExtraKeyURLs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get keys: %w", err)
+	}
+	if m.ExtraRepositories != nil {
+		repos = append(repos, m.ExtraRepositories...)
 	}
 	indexes, err := goapk.GetRepositoryIndexes(ctx, repos, keys, m.Arch, goapk.WithHTTPClient(http.DefaultClient))
 	if err != nil {
@@ -272,8 +279,11 @@ func (m *Alpine) withPkgs(
 	return ctr, nil
 }
 
-func fetchKeys(branch goapk.ReleaseBranch, arch string) (map[string][]byte, error) {
+func fetchKeys(branch goapk.ReleaseBranch, arch string, extraKeyURLs []string) (map[string][]byte, error) {
 	urls := branch.KeysFor(arch, time.Now())
+	if extraKeyURLs != nil {
+		urls = append(urls, extraKeyURLs...)
+	}
 	keys := make(map[string][]byte)
 	for _, u := range urls {
 		res, err := http.Get(u)

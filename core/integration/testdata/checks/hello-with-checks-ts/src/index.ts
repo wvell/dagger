@@ -1,10 +1,17 @@
 /**
  * A module for HelloWithChecksTs functions
  */
-import { dag, object, func, check } from "@dagger.io/dagger";
+import { Container, dag, object, func, check } from "@dagger.io/dagger";
 
 @object()
 class HelloWithChecksTs {
+  @func()
+  baseImage: string;
+
+  constructor(baseImage: string = "alpine:3") {
+    this.baseImage = baseImage;
+  }
+
   /**
    * Returns a passing check
    */
@@ -13,7 +20,7 @@ class HelloWithChecksTs {
   async passingCheck(): Promise<void> {
     await dag
       .container()
-      .from("alpine:3")
+      .from(this.baseImage)
       .withExec(["sh", "-c", "exit 0"])
       .sync();
   }
@@ -26,8 +33,32 @@ class HelloWithChecksTs {
   async failingCheck(): Promise<void> {
     await dag
       .container()
-      .from("alpine:3")
+      .from(this.baseImage)
       .withExec(["sh", "-c", "exit 1"])
       .sync();
+  }
+
+  /**
+   * Returns a container which runs as a passing check
+   */
+  @func()
+  @check()
+  passingContainer(): Container {
+    return dag
+      .container()
+      .from(this.baseImage)
+      .withExec(["sh", "-c", "exit 0"]);
+  }
+
+  /**
+   * Returns a container which runs as a failing check
+   */
+  @func()
+  @check()
+  failingContainer(): Container {
+    return dag
+      .container()
+      .from(this.baseImage)
+      .withExec(["sh", "-c", "exit 1"]);
   }
 }

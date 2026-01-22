@@ -24,6 +24,7 @@ import (
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
 	"github.com/dagger/dagger/engine"
 	"github.com/dagger/dagger/engine/config"
+	"github.com/dagger/dagger/engine/ebpf"
 	bkconfig "github.com/dagger/dagger/internal/buildkit/cmd/buildkitd/config"
 	"github.com/dagger/dagger/internal/buildkit/util/apicaps"
 	"github.com/dagger/dagger/internal/buildkit/util/appcontext"
@@ -35,17 +36,19 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/moby/sys/reexec"
 	"github.com/moby/sys/userns"
-	sloglogrus "github.com/samber/slog-logrus/v2"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 
 	"dagger.io/dagger/telemetry"
 	"github.com/dagger/dagger/engine/buildkit/cacerts"
+	"github.com/dagger/dagger/engine/ebpf/filetracer"
+	"github.com/dagger/dagger/engine/ebpf/ovltracer"
 	"github.com/dagger/dagger/engine/server"
 	"github.com/dagger/dagger/engine/slog"
 	"github.com/dagger/dagger/network"
@@ -53,6 +56,30 @@ import (
 )
 
 const gracefulStopTimeout = 5 * time.Minute // need to sync disks, which could be expensive
+const ebpfProgramEnvPrefix = "DAGGER_EBPF_PROG_"
+
+type ebpfProgram struct {
+	name string
+	new  func() (ebpf.Tracer, error)
+}
+
+// Program names map to env vars: _DAGGER_EBPF_PROG_<NAME> (uppercased, non-alnum -> _).
+var ebpfPrograms = []ebpfProgram{
+	{
+		name: "ovl_inuse",
+		new:  ovltracer.New,
+	},
+	{
+		name: "filetracer",
+		new:  filetracer.New,
+	},
+}
+
+// eBPF programs that run by default when extra-debug (or trace) logging is enabled.
+var defaultEbpfPrograms = map[string]struct{}{
+	// "ovl_inuse":  {},
+	// "filetracer": {},
+}
 
 func init() {
 	apicaps.ExportedProduct = "dagger-engine"
@@ -60,6 +87,39 @@ func init() {
 
 	if reexec.Init() {
 		os.Exit(0)
+	}
+}
+
+func enabledEbpfPrograms(loadDefaults bool) []ebpfProgram {
+	enabled := make([]ebpfProgram, 0, len(ebpfPrograms))
+	for _, prog := range ebpfPrograms {
+		envName := ebpfProgramEnvPrefix + strings.ToUpper(prog.name)
+		if _, ok := os.LookupEnv(envName); ok {
+			enabled = append(enabled, prog)
+			continue
+		}
+		if loadDefaults {
+			if _, ok := defaultEbpfPrograms[prog.name]; ok {
+				enabled = append(enabled, prog)
+			}
+		}
+	}
+	return enabled
+}
+
+func startEbpfProgram(ctx context.Context, prog ebpfProgram) func() {
+	tracer, err := prog.new()
+	if err != nil {
+		slog.Debug("eBPF program disabled", "program", prog.name, "reason", err.Error())
+		return nil
+	}
+	tracerCtx, cancelTracer := context.WithCancel(ctx)
+	go tracer.Run(tracerCtx)
+	return func() {
+		cancelTracer()
+		if err := tracer.Close(); err != nil {
+			slog.Warn("eBPF program close failed", "program", prog.name, "error", err)
+		}
 	}
 }
 
@@ -253,7 +313,7 @@ func main() { //nolint:gocyclo
 	ctx, cancel := context.WithCancelCause(appcontext.Context())
 
 	app.Action = func(c *cli.Context) error {
-		bklog.G(ctx).Debug("starting dagger engine version:", engineVersion)
+		bklog.G(ctx).Info("starting dagger engine version:", engineVersion)
 		defer cancel(errors.New("main done"))
 		// TODO: On Windows this always returns -1. The actual "are you admin" check is very Windows-specific.
 		// See https://github.com/golang/go/issues/28804#issuecomment-505326268 for the "short" version.
@@ -312,10 +372,6 @@ func main() { //nolint:gocyclo
 
 		logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 
-		// Wire slog up to send to Logrus so engine logs using slog also get sent
-		// to Cloud
-		slogOpts := sloglogrus.Option{}
-
 		noiseReduceHook := &noiseReductionHook{
 			ignoreLogger: logrus.New(),
 		}
@@ -334,12 +390,12 @@ func main() { //nolint:gocyclo
 				logLevel = config.LevelDebug
 			}
 		}
+		var slogLevel slog.Level
 		if logLevel != "" {
-			slogLevel, err := logLevel.ToSlogLevel()
+			slogLevel, err = logLevel.ToSlogLevel()
 			if err != nil {
 				return err
 			}
-			slogOpts.Level = slogLevel
 
 			logrusLevel, err := logLevel.ToLogrusLevel()
 			if err != nil {
@@ -353,11 +409,36 @@ func main() { //nolint:gocyclo
 			}
 		}
 
-		sloglogrus.LogLevels[slog.LevelExtraDebug] = logrus.DebugLevel
-		sloglogrus.LogLevels[slog.LevelTrace] = logrus.TraceLevel
-		slog.SetDefault(slog.New(slogOpts.NewLogrusHandler()))
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+			Level: slogLevel,
+		})))
 
-		bklog.G(context.Background()).Debugf("engine name: %s", engineName)
+		extraDebugEnabled := slogLevel == slog.LevelExtraDebug || slogLevel == slog.LevelTrace
+		enabledEbpfPrgs := enabledEbpfPrograms(extraDebugEnabled)
+		loadEbpf := len(enabledEbpfPrgs) > 0
+		if loadEbpf {
+			_, err := os.Lstat("/sys/kernel/tracing/trace")
+			switch {
+			case err == nil:
+			case errors.Is(err, os.ErrNotExist):
+				if err := unix.Mount("", "/sys/kernel/tracing", "tracefs", unix.MS_NODEV, ""); err != nil {
+					loadEbpf = false
+					slog.Debug("could not mount tracefs, skipping ebpf", "err", err.Error())
+				}
+			default:
+				loadEbpf = false
+				slog.Debug("failed to stat /sys/kernel/tracing, skipping ebpf", "err", err.Error())
+			}
+		}
+		if loadEbpf {
+			for _, prog := range enabledEbpfPrgs {
+				if cleanup := startEbpfProgram(ctx, prog); cleanup != nil {
+					defer cleanup()
+				}
+			}
+		}
+
+		bklog.G(context.Background()).Infof("engine name: %s", engineName)
 
 		if bkcfg.GRPC.DebugAddress != "" {
 			if err := setupDebugHandlers(bkcfg.GRPC.DebugAddress); err != nil {
@@ -444,8 +525,10 @@ func main() { //nolint:gocyclo
 		select {
 		case serverErr := <-errCh:
 			err = serverErr
+			bklog.G(ctx).WithError(err).Error("server error")
 			cancel(fmt.Errorf("server error: %w", serverErr))
 		case <-ctx.Done():
+			bklog.G(context.WithoutCancel(ctx)).WithError(ctx.Err()).Error("server context canceled")
 			// context should only be cancelled when a signal is received, which
 			// isn't an error
 			if ctx.Err() != context.Canceled {
@@ -455,7 +538,7 @@ func main() { //nolint:gocyclo
 
 		cancelNetworking(errors.New("shutdown"))
 
-		bklog.G(ctx).Infof("stopping server")
+		bklog.G(context.WithoutCancel(ctx)).Infof("stopping server")
 		if os.Getenv("NOTIFY_SOCKET") != "" {
 			notified, notifyErr := sddaemon.SdNotify(false, sddaemon.SdNotifyStopping)
 			bklog.G(ctx).Debugf("SdNotifyStopping notified=%v, err=%v", notified, notifyErr)
@@ -472,6 +555,8 @@ func main() { //nolint:gocyclo
 	}
 
 	app.After = func(*cli.Context) error {
+		fmt.Println("shutting down telemetry...")
+		defer fmt.Println("telemetry shut down complete")
 		telemetry.Close()
 		return nil
 	}

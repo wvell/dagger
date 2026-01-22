@@ -29,7 +29,6 @@ import (
 	"github.com/dagger/dagger/engine/cache"
 	"github.com/dagger/dagger/engine/client/pathutil"
 	"github.com/dagger/dagger/engine/server/resource"
-	fsutiltypes "github.com/dagger/dagger/internal/fsutil/types"
 	"github.com/iancoleman/strcase"
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sync/errgroup"
@@ -81,6 +80,10 @@ func (s *moduleSourceSchema) Install(dag *dagql.Server) {
 			Doc(`Obtain a contextual directory argument for the given path, include/excludes and module.`),
 		dagql.NodeFuncWithCacheKey("_contextFile", s.contextFile, dagql.CachePerCall).
 			Doc(`Obtain a contextual file argument for the given path and module.`),
+		dagql.NodeFuncWithCacheKey("_contextGitRepository", s.contextGitRepository, dagql.CachePerCall).
+			Doc(`Obtain a contextual git repository argument for the given module.`),
+		dagql.NodeFuncWithCacheKey("_contextGitRef", s.contextGitRef, dagql.CachePerCall).
+			Doc(`Obtain a contextual git ref argument for the given module.`),
 	}.Install(dag)
 
 	dagql.Fields[*core.Directory]{
@@ -389,7 +392,7 @@ func (s *moduleSourceSchema) localModuleSource(
 				// found a dep in the default dagger.json with the name localPath, load it and return it
 				parsedRef, err := core.ParseRefString(
 					ctx,
-					core.StatFSFunc(func(ctx context.Context, path string) (*fsutiltypes.Stat, error) {
+					core.StatFSFunc(func(ctx context.Context, path string) (string, *core.Stat, error) {
 						path = filepath.Join(defaultFindUpSourceRootDir, path)
 						return core.NewCallerStatFS(bk).Stat(ctx, path)
 					}),
@@ -616,12 +619,17 @@ func (s *moduleSourceSchema) gitModuleSource(
 		// first validate the given path exists at all, otherwise weird things like
 		// `dagger -m github.com/dagger/dagger/not/a/real/dir` can succeed because
 		// they find-up to a real dagger.json
-		statFS := core.NewCoreDirStatFS(gitSrc.ContextDirectory.Self(), bk)
-		if _, err := statFS.Stat(ctx, gitSrc.SourceRootSubpath); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return inst, fmt.Errorf("path %q does not exist in git repo", gitSrc.SourceRootSubpath)
+		statFS := core.StatFSFunc(func(ctx context.Context, path string) (string, *core.Stat, error) {
+			return core.CallDirStat(ctx, gitSrc.ContextDirectory, path)
+		})
+
+		if gitSrc.SourceRootSubpath != "" {
+			if _, _, err := statFS.Stat(ctx, gitSrc.SourceRootSubpath); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return inst, fmt.Errorf("path %q does not exist in git repo", gitSrc.SourceRootSubpath)
+				}
+				return inst, fmt.Errorf("failed to stat git module source: %w", err)
 			}
-			return inst, fmt.Errorf("failed to stat git module source: %w", err)
 		}
 
 		configDir, found, err := core.Host{}.FindUp(ctx, statFS,
@@ -990,6 +998,88 @@ func (s *moduleSourceSchema) contextFile(
 	// different cache keys than normally loaded host files. Support for multiple
 	// cache keys per result should help fix this.
 	dgst := hashutil.HashStrings(f.ID().Digest().String(), "contextualFile")
+	inst = inst.WithObjectDigest(dgst)
+	return inst, nil
+}
+
+func (s *moduleSourceSchema) contextGitRepository(
+	ctx context.Context,
+	query dagql.ObjectResult[*core.Query],
+	args struct {
+		// the human-readable name of the module, currently just to help telemetry look nicer
+		Module string
+
+		// the content digest of the module
+		Digest string
+	},
+) (inst dagql.ObjectResult[*core.GitRepository], err error) {
+	dag, err := query.Self().Server.Server(ctx)
+	if err != nil {
+		return inst, fmt.Errorf("failed to get dag server: %w", err)
+	}
+	mod, err := core.GetModuleFromContentDigest(ctx, dag, args.Module, args.Digest)
+	if err != nil {
+		return inst, err
+	}
+	f, err := mod.Self().ContextSource.Value.Self().LoadContextGit(ctx, dag)
+	if err != nil {
+		return inst, fmt.Errorf("failed to load contextual git repository: %w", err)
+	}
+
+	inst, err = dagql.NewObjectResultForCurrentID(ctx, dag, f.Self())
+	if err != nil {
+		return inst, fmt.Errorf("failed to create git repository result: %w", err)
+	}
+	// mix-in a constant string to avoid collisions w/ normal host file loads, which
+	// can lead function calls encountering cached results that include contextual
+	// file loads from older sessions to load from the wrong path
+	dgst := hashutil.HashStrings(f.ID().Digest().String(), "contextualGitRepository")
+	inst = inst.WithObjectDigest(dgst)
+	return inst, nil
+}
+
+func (s *moduleSourceSchema) contextGitRef(
+	ctx context.Context,
+	query dagql.ObjectResult[*core.Query],
+	args struct {
+		// the human-readable name of the module, currently just to help telemetry look nicer
+		Module string
+
+		// the content digest of the module
+		Digest string
+	},
+) (inst dagql.ObjectResult[*core.GitRef], err error) {
+	dag, err := query.Self().Server.Server(ctx)
+	if err != nil {
+		return inst, fmt.Errorf("failed to get dag server: %w", err)
+	}
+	mod, err := core.GetModuleFromContentDigest(ctx, dag, args.Module, args.Digest)
+	if err != nil {
+		return inst, err
+	}
+	f, err := mod.Self().ContextSource.Value.Self().LoadContextGit(ctx, dag)
+	if err != nil {
+		return inst, fmt.Errorf("failed to load contextual git ref: %w", err)
+	}
+
+	var gitRef dagql.ObjectResult[*core.GitRef]
+	err = dag.Select(ctx, f, &gitRef,
+		dagql.Selector{
+			Field: "head",
+		},
+	)
+	if err != nil {
+		return inst, fmt.Errorf("load contextual git ref: %w", err)
+	}
+
+	inst, err = dagql.NewObjectResultForCurrentID(ctx, dag, gitRef.Self())
+	if err != nil {
+		return inst, fmt.Errorf("failed to create git ref result: %w", err)
+	}
+	// mix-in a constant string to avoid collisions w/ normal host file loads, which
+	// can lead function calls encountering cached results that include contextual
+	// file loads from older sessions to load from the wrong path
+	dgst := hashutil.HashStrings(f.ID().Digest().String(), "contextualGitRef")
 	inst = inst.WithObjectDigest(dgst)
 	return inst, nil
 }
@@ -1595,6 +1685,15 @@ func (s *moduleSourceSchema) deduplicateAndSortItems(
 			if item.Self().SourceRootSubpath != "" {
 				symbolicItemStr += "/" + strings.TrimPrefix(item.Self().SourceRootSubpath, "/")
 			}
+			// This enables toolchains to install multiple versions from the same source
+			// For dependencies, we want to deduplicate by base path (without version) so updates work correctly
+			if accessor.typ == core.ModuleRelationTypeToolchain {
+				if item.Self().Git.Version != "" {
+					symbolicItemStr += "@" + item.Self().Git.Version
+				} else if item.Self().Git.Commit != "" {
+					symbolicItemStr += "@" + item.Self().Git.Commit
+				}
+			}
 		}
 
 		_, isDuplicateSymbolic := symbolicItems[symbolicItemStr]
@@ -1714,11 +1813,21 @@ func (s *moduleSourceSchema) moduleSourceUpdateItems(
 		if itemSrcRoot := existingItem.Self().SourceRootSubpath; itemSrcRoot != "" {
 			existingSymbolic += "/" + strings.TrimPrefix(itemSrcRoot, "/")
 		}
+		// For matching purposes, include version/commit in symbolic representation to match deduplication logic
+		// This ensures proper matching when updating dependencies with version information
+		existingSymbolicWithVersion := existingSymbolic
+		if existingItem.Self().Git.Version != "" {
+			existingSymbolicWithVersion += "@" + existingItem.Self().Git.Version
+		} else if existingItem.Self().Git.Commit != "" {
+			existingSymbolicWithVersion += "@" + existingItem.Self().Git.Commit
+		}
 
+		matched := false
 		for updateReq := range updateReqs {
-			if updateReq.symbolic != existingName && updateReq.symbolic != existingSymbolic {
+			if updateReq.symbolic != existingName && updateReq.symbolic != existingSymbolic && updateReq.symbolic != existingSymbolicWithVersion {
 				continue
 			}
+			matched = true
 			delete(updateReqs, updateReq)
 
 			updateVersion := updateReq.version
@@ -1744,6 +1853,12 @@ func (s *moduleSourceSchema) moduleSourceUpdateItems(
 			}
 
 			newUpdatedArgs = append(newUpdatedArgs, dagql.NewID[*core.ModuleSource](updatedItem.ID()))
+			break
+		}
+
+		// If this item wasn't matched for update, keep it as-is
+		if !matched {
+			newUpdatedArgs = append(newUpdatedArgs, dagql.NewID[*core.ModuleSource](existingItem.ID()))
 		}
 	}
 
@@ -2263,13 +2378,6 @@ func (s *moduleSourceSchema) loadModuleSourceConfig(
 	for i, depSrc := range src.Dependencies {
 		depCfg := &modules.ModuleConfigDependency{
 			Name: depSrc.Self().ModuleName,
-		}
-
-		// TODO: this is for backwards compatibility until the configuration change is released
-		if i < len(src.ConfigDependencies) && src.ConfigDependencies[i] != nil {
-			//nolint:staticcheck
-			depCfg.Arguments = src.ConfigDependencies[i].Arguments
-			depCfg.Customizations = src.ConfigDependencies[i].Customizations
 		}
 
 		modCfg.Dependencies[i] = depCfg
@@ -3494,11 +3602,8 @@ func (s *moduleSourceSchema) moduleSourceAsModule(
 	}
 
 	// save a result for the final module based on its content hash, currently used in the _contextDirectory API
-	contentCacheKey := mod.ContentDigestCacheKey()
-	contentHashedInst := inst.WithObjectDigest(digest.Digest(contentCacheKey.CallKey))
-	_, err = dag.Cache.GetOrInitializeValue(ctx, contentCacheKey, contentHashedInst)
-	if err != nil {
-		return inst, fmt.Errorf("failed to get or initialize instance: %w", err)
+	if err := core.CacheModuleByContentDigest(ctx, dag, inst); err != nil {
+		return inst, fmt.Errorf("failed to cache module by content digest: %w", err)
 	}
 
 	return inst, nil

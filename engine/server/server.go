@@ -828,12 +828,23 @@ func (srv *Server) FileSyncer() *filesync.FileSyncer {
 	return srv.workerFileSyncer
 }
 
+func (srv *Server) SourceManager() *source.Manager {
+	return srv.workerSourceManager
+}
+
+func (srv *Server) CacheAccessor() bkcache.Accessor {
+	return srv.workerCache
+}
+
 func (srv *Server) Info(context.Context, *controlapi.InfoRequest) (*controlapi.InfoResponse, error) {
 	return &controlapi.InfoResponse{
 		BuildkitVersion: &apitypes.BuildkitVersion{
 			Package:  engine.Package,
 			Version:  engine.Version,
 			Revision: srv.engineName,
+		},
+		SystemInfo: &controlapi.SystemInfo{
+			NumCPU: int32(runtime.NumCPU()),
 		},
 	}, nil
 }

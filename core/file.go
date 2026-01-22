@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
@@ -23,7 +24,6 @@ import (
 	"github.com/dagger/dagger/internal/buildkit/client/llb"
 	bkgw "github.com/dagger/dagger/internal/buildkit/frontend/gateway/client"
 	"github.com/dagger/dagger/internal/buildkit/solver/pb"
-	fstypes "github.com/dagger/dagger/internal/fsutil/types"
 	"github.com/opencontainers/go-digest"
 	"github.com/vektah/gqlparser/v2/ast"
 	"go.opentelemetry.io/otel/trace"
@@ -460,45 +460,16 @@ func (file *File) Digest(ctx context.Context, excludeMetadata bool) (string, err
 	return digest.FromBytes(h.Sum(nil)).String(), nil
 }
 
-func (file *File) Stat(ctx context.Context) (*fstypes.Stat, error) {
-	query, err := CurrentQuery(ctx)
+func (file *File) Stat(ctx context.Context) (*Stat, error) {
+	immutableRef, err := getRefOrEvaluate(ctx, file)
 	if err != nil {
 		return nil, err
 	}
-	bk, err := query.Buildkit(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	if immutableRef == nil {
+		return nil, &os.PathError{Op: "stat", Path: file.File, Err: syscall.ENOENT}
 	}
 
-	ref, err := bkRef(ctx, bk, file.LLB)
-	if err != nil {
-		return nil, err
-	}
-
-	return ref.StatFile(ctx, bkgw.StatRequest{
-		Path: file.File,
-	})
-}
-
-// TODO replace old Stat function with this one (and rename this back to Stat)
-func (file *File) StatDagOp(ctx context.Context, srv *dagql.Server) (*Stat, error) {
-	res, err := file.Evaluate(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	ref, err := res.SingleRef()
-	if err != nil {
-		return nil, err
-	}
-	if ref == nil {
-		return nil, nil
-	}
-
-	immutableRef, err := ref.CacheRef(ctx)
-	if err != nil {
-		return nil, err
-	}
+	bkSessionGroup := requiresBuildkitSessionGroup(ctx)
 
 	osStatFunc := os.Stat
 	rootPathFunc := containerdfs.RootPath
@@ -511,13 +482,13 @@ func (file *File) StatDagOp(ctx context.Context, srv *dagql.Server) (*Stat, erro
 	// }
 
 	var fileInfo os.FileInfo
-	err = MountRef(ctx, immutableRef, nil, func(root string, _ *mount.Mount) error {
+	err = MountRef(ctx, immutableRef, bkSessionGroup, func(root string, _ *mount.Mount) error {
 		resolvedPath, err := rootPathFunc(root, file.File)
 		if err != nil {
 			return err
 		}
 		fileInfo, err = osStatFunc(resolvedPath)
-		return RestoreErrPath(err, file.File)
+		return TrimErrPathPrefix(err, root)
 	})
 	if err != nil {
 		return nil, err
@@ -529,42 +500,29 @@ func (file *File) StatDagOp(ctx context.Context, srv *dagql.Server) (*Stat, erro
 		Size:        int(fileInfo.Size()),
 		Name:        fileInfo.Name(),
 		Permissions: int(fileInfo.Mode().Perm()),
-	}
-
-	if m.IsDir() {
-		stat.FileType = FileTypeDirectory
-	} else if m.IsRegular() {
-		stat.FileType = FileTypeRegular
-	} else if m&fs.ModeSymlink != 0 {
-		stat.FileType = FileTypeSymlink
-	} else {
-		stat.FileType = FileTypeUnknown
+		FileType:    FileModeToFileType(m),
 	}
 
 	return stat, nil
 }
 
 func (file *File) WithName(ctx context.Context, filename string) (*File, error) {
-	// Clone the file
 	file = file.Clone()
-
-	st, err := file.State()
-	if err != nil {
-		return nil, err
-	}
-
-	// Create a new file with the new name
-	newFile := llb.Scratch().File(llb.Copy(st, file.File, filepath.Base(filename)))
-
-	def, err := newFile.Marshal(ctx, llb.Platform(file.Platform.Spec()))
-	if err != nil {
-		return nil, err
-	}
-
-	file.LLB = def.ToPB()
-	file.File = filepath.Base(filename)
-
-	return file, nil
+	return execInMount(ctx, file, func(root string) error {
+		src, err := RootPathWithoutFinalSymlink(root, file.File)
+		if err != nil {
+			return err
+		}
+		dst, err := RootPathWithoutFinalSymlink(root, filename)
+		if err != nil {
+			return err
+		}
+		err = os.Rename(src, dst)
+		if err != nil {
+			return TrimErrPathPrefix(err, root)
+		}
+		return nil
+	}, withSavedSnapshot("withName %s", filename))
 }
 
 func (file *File) WithTimestamps(ctx context.Context, unix int) (*File, error) {

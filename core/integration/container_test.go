@@ -21,7 +21,9 @@ import (
 	"time"
 
 	"github.com/containerd/platforms"
+	bkconfig "github.com/dagger/dagger/internal/buildkit/cmd/buildkitd/config"
 	"github.com/dagger/dagger/internal/buildkit/identity"
+	resolverconfig "github.com/dagger/dagger/internal/buildkit/util/resolver/config"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -3349,6 +3351,76 @@ func (ContainerSuite) TestWithRegistryAuth(ctx context.Context, t *testctx.T) {
 	require.Contains(t, pushedRef, "@sha256:")
 }
 
+// Regression test for #11667: Directory/File access on private registry images
+// requires auth credentials to be passed through when fetching uncached blobs.
+func (ContainerSuite) TestWithRegistryAuthFileAndDirectoryAccess(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	const htpasswd = "john:$2y$05$/iP8ud0Fs8o3NLlElyfVVOp6LesJl3oRLYoc3neArZKWX10OhynSC"
+	registrySvc := c.Container().
+		From("registry:2").
+		WithNewFile("/auth/htpasswd", htpasswd).
+		WithEnvVariable("REGISTRY_AUTH", "htpasswd").
+		WithEnvVariable("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm").
+		WithEnvVariable("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd").
+		WithExposedPort(5000, dagger.ContainerWithExposedPortOpts{Protocol: dagger.NetworkProtocolTcp}).
+		AsService(dagger.ContainerAsServiceOpts{UseEntrypoint: true})
+
+	devEngine := devEngineContainerAsService(devEngineContainer(c,
+		func(ctr *dagger.Container) *dagger.Container {
+			return ctr.WithServiceBinding("registry", registrySvc)
+		},
+		engineWithBkConfig(ctx, t, func(ctx context.Context, t *testctx.T, cfg bkconfig.Config) bkconfig.Config {
+			cfg.Registries = map[string]resolverconfig.RegistryConfig{
+				"registry:5000": {PlainHTTP: ptr(true)},
+			}
+			return cfg
+		}),
+	))
+
+	const authFile = `{"auths":{"registry:5000":{"auth":"am9objp4RmxlamFQZGpydDI1RHZy"}}}` // john:xFlejaPdjrt25Dvr
+	imageRef := "registry:5000/test:" + identity.NewID()
+
+	clientCtr := func() *dagger.Container {
+		return engineClientContainer(ctx, t, c, devEngine).
+			WithNewFile("/docker/config.json", authFile).
+			WithEnvVariable("DOCKER_CONFIG", "/docker")
+	}
+
+	_, err := clientCtr().
+		With(daggerNonNestedExec("core",
+			"container",
+			"from", "--address", alpineImage,
+			"with-new-file", "--path", "/test-dir/file.txt", "--contents", "dir-content",
+			"with-new-file", "--path", "/test-file.txt", "--contents", "file-content",
+			"publish", "--address", imageRef,
+		)).
+		Sync(ctx)
+	require.NoError(t, err)
+
+	// Prune to force re-fetch from registry
+	_, err = clientCtr().
+		With(daggerNonNestedExec("core", "engine", "local-cache", "prune")).
+		Sync(ctx)
+	require.NoError(t, err)
+
+	out, err := clientCtr().
+		With(daggerNonNestedExec("-c",
+			"container | from "+imageRef+" | directory /test-dir | entries",
+		)).
+		Stdout(ctx)
+	require.NoError(t, err)
+	require.Contains(t, out, "file.txt")
+
+	out, err = clientCtr().
+		With(daggerNonNestedExec("-c",
+			"container | from "+imageRef+" | file /test-file.txt | contents",
+		)).
+		Stdout(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "file-content", strings.TrimSpace(out))
+}
+
 func (ContainerSuite) TestImageRef(ctx context.Context, t *testctx.T) {
 	t.Run("should test query returning imageRef", func(ctx context.Context, t *testctx.T) {
 		res, err := testutil.Query[struct {
@@ -5338,4 +5410,33 @@ func (ContainerSuite) TestFileCaching(ctx context.Context, t *testctx.T) {
 			}).File("rand1")
 		})
 	})
+}
+
+func (ContainerSuite) TestContainerCaching(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+
+	ctr := c.Container().From(alpineImage).WithNewFile("file", "data")
+
+	var err error
+	testRefs := make([]string, 2)
+	pushedRefs := make([]string, 2)
+	for i := 0; i < 2; i++ {
+		testRefs[i] = registryRef("container-caching")
+		pushedRefs[i], err = ctr.Publish(ctx, testRefs[i])
+		require.NoError(t, err)
+	}
+
+	require.NotEqual(t, testRefs[0], testRefs[1])
+	require.NotEqual(t, pushedRefs[0], pushedRefs[1])
+
+	output := make([]string, 2)
+	for i := 0; i < 2; i++ {
+		output[i], err = c.Container().From(testRefs[i]).
+			WithExec([]string{"sh", "-c", "head -c 99 /dev/random | base64 -w0"}).
+			Stdout(ctx)
+		require.NoError(t, err)
+		require.Len(t, output[i], 132) // test that 99 chars were randomly produced, this accounts for 4/3 times base64 bloat
+	}
+
+	require.Equal(t, output[0], output[1], "container exec was not cached")
 }

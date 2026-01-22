@@ -40,6 +40,24 @@ var (
 	errEmptyResultRef = fmt.Errorf("empty result reference")
 )
 
+// requiresBuildkitSessionGroup returns a session group for operations that need client resources
+// (credentials, secrets, etc). Some operations run outside the DagOp context (e.g., Stat called
+// internally by Directory.Directory), so we fall back to the buildkit client's session.
+func requiresBuildkitSessionGroup(ctx context.Context) bksession.Group {
+	if g, ok := buildkit.CurrentBuildkitSessionGroup(ctx); ok {
+		return g
+	}
+	query, err := CurrentQuery(ctx)
+	if err != nil {
+		return nil
+	}
+	bk, err := query.Buildkit(ctx)
+	if err != nil {
+		return nil
+	}
+	return buildkit.NewSessionGroup(bk.ID())
+}
+
 type Evaluatable interface {
 	dagql.Typed
 	Evaluate(context.Context) (*buildkit.Result, error)
@@ -83,7 +101,7 @@ func collectPBDefinitions(ctx context.Context, value dagql.Typed) ([]*pb.Definit
 		// NB: being SUPER cautious for now, since this feels a bit spooky to drop
 		// on the floor. might be worth just implementing HasPBDefinitions for
 		// everything. (would be nice to just skip scalars though.)
-		slog.Warn("collectPBDefinitions: unhandled type", "type", fmt.Sprintf("%T", value))
+		slog.Debug("collectPBDefinitions: unhandled type", "type", fmt.Sprintf("%T", value))
 		return nil, nil
 	}
 }
@@ -563,11 +581,27 @@ func mountObj[T fileOrDirectory](ctx context.Context, obj T, optFns ...mountObjO
 }
 
 // RestoreErrPath will restore the path of an error, which is useful for both removing buildkit mount root paths and referencing uncleaned paths
+// Note: TrimErrPathPrefix should be used instead when a root prefix is known
 func RestoreErrPath(err error, path string) error {
 	if pe, ok := err.(*os.PathError); ok {
 		pe.Path = path
 	} else if err != nil {
 		slog.Warn("RestorePathErr: unhandled type", "type", fmt.Sprintf("%T", err))
+	}
+	return err
+}
+
+// TrimErrPathPrefix will trim a prefix from the path of an error, which is useful for both removing buildkit mount root paths and referencing uncleaned paths
+func TrimErrPathPrefix(err error, prefix string) error {
+	switch e := err.(type) {
+	case *os.PathError:
+		e.Path = strings.TrimPrefix(e.Path, prefix)
+	case *os.LinkError:
+		e.Old = strings.TrimPrefix(e.Old, prefix)
+		e.New = strings.TrimPrefix(e.New, prefix)
+	case nil:
+	default:
+		slog.Debug("TrimErrPathPrefix: unhandled type", "type", fmt.Sprintf("%T", err))
 	}
 	return err
 }

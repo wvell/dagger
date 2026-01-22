@@ -18,8 +18,12 @@ import (
 	"dagger.io/dagger/telemetry"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/transfer/archive"
 	"github.com/containerd/platforms"
+	"github.com/dagger/dagger/core/containersource"
+	bkcache "github.com/dagger/dagger/internal/buildkit/cache"
+	bkclient "github.com/dagger/dagger/internal/buildkit/client"
 	"github.com/dagger/dagger/internal/buildkit/client/llb"
 	"github.com/dagger/dagger/internal/buildkit/client/llb/sourceresolver"
 	"github.com/dagger/dagger/internal/buildkit/exporter/containerimage/exptypes"
@@ -28,6 +32,7 @@ import (
 	"github.com/dagger/dagger/internal/buildkit/identity"
 	"github.com/dagger/dagger/internal/buildkit/solver/pb"
 	"github.com/dagger/dagger/internal/buildkit/util/leaseutil"
+	"github.com/dagger/dagger/util/containerutil"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -35,6 +40,7 @@ import (
 	"github.com/vektah/gqlparser/v2/ast"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/dagql/call"
@@ -51,11 +57,6 @@ type DefaultTerminalCmdOpts struct {
 
 	// Grant the process all root capabilities
 	InsecureRootCapabilities dagql.Optional[dagql.Boolean] `default:"false"`
-}
-
-type ContainerAnnotation struct {
-	Key   string
-	Value string
 }
 
 // Container is a content-addressed container.
@@ -79,7 +80,7 @@ type Container struct {
 	Platform Platform
 
 	// OCI annotations
-	Annotations []ContainerAnnotation
+	Annotations []containerutil.ContainerAnnotation
 
 	// Secrets to expose to the container.
 	Secrets []ContainerSecret
@@ -502,45 +503,51 @@ func (mnts ContainerMounts) Replace(newMnt ContainerMount) (ContainerMounts, err
 }
 
 func (container *Container) FromRefString(ctx context.Context, addr string) (*Container, error) {
-	query, err := CurrentQuery(ctx)
-	if err != nil {
-		return nil, err
-	}
-	bk, err := query.Buildkit(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
-	}
-
-	platform := container.Platform
-
 	refName, err := reference.ParseNormalizedNamed(addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse image address %s: %w", addr, err)
 	}
+
 	// add a default :latest if no tag or digest, otherwise this is a no-op
 	refName = reference.TagNameOnly(refName)
 
-	if refName, isCanonical := refName.(reference.Canonical); isCanonical {
-		return container.FromCanonicalRef(ctx, refName, nil)
+	var containerArgs []dagql.NamedInput
+	if container.Platform.OS != "" {
+		containerArgs = append(containerArgs, dagql.NamedInput{Name: "platform", Value: dagql.Opt(container.Platform)})
 	}
 
-	_, digest, cfgBytes, err := bk.ResolveImageConfig(ctx, refName.String(), sourceresolver.Opt{
-		Platform: ptr(platform.Spec()),
-		ImageOpt: &sourceresolver.ResolveImageOpt{
-			ResolveMode: llb.ResolveModeDefault.String(),
+	srv, err := CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Dagger server: %w", err)
+	}
+
+	ctx, span := Tracer(ctx).Start(ctx, fmt.Sprintf("from %s", addr),
+		telemetry.Internal(),
+	)
+	defer telemetry.EndWithCause(span, nil)
+
+	var ctr dagql.ObjectResult[*Container]
+	err = srv.Select(ctx, srv.Root(), &ctr,
+		dagql.Selector{
+			Field: "container",
+			Args:  containerArgs,
 		},
-	})
+		dagql.Selector{
+			Field: "from",
+			Args: []dagql.NamedInput{
+				{Name: "address", Value: dagql.String(refName.String())},
+			},
+		},
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve image %q (platform: %q): %w", refName.String(), platform.Format(), err)
-	}
-	canonRefName, err := reference.WithDigest(refName, digest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to set digest on image %s: %w", refName.String(), err)
+		return nil, err
 	}
 
-	return container.FromCanonicalRef(ctx, canonRefName, cfgBytes)
+	return ctr.Self(), nil
 }
 
+// FromCanonicalRef implements the dagop portion of the "from" command: it fetches an image, and updates the root fs
+// to point to a snapshot of the referenced image
 func (container *Container) FromCanonicalRef(
 	ctx context.Context,
 	refName reference.Canonical,
@@ -553,13 +560,97 @@ func (container *Container) FromCanonicalRef(
 	if err != nil {
 		return nil, err
 	}
+
+	platform := container.Platform
+
+	refStr := refName.String()
+
+	bk, err := query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	hsm, err := containersource.NewSource(containersource.SourceOpt{
+		Snapshotter:   bk.Worker.Snapshotter,
+		ContentStore:  bk.Worker.ContentStore(),
+		ImageStore:    bk.Worker.ImageStore,
+		CacheAccessor: query.BuildkitCache(),
+		RegistryHosts: bk.Worker.RegistryHosts,
+		ResolverType:  containersource.ResolverTypeRegistry,
+		LeaseManager:  bk.Worker.LeaseManager(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	attrs := map[string]string{}
+	id, err := hsm.Identifier(refStr, attrs, &pb.Platform{
+		Architecture: platform.Architecture,
+		OS:           platform.OS,
+		Variant:      platform.Variant,
+		OSVersion:    platform.OSVersion,
+		OSFeatures:   platform.OSFeatures,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	src, err := hsm.Resolve(ctx, id, query.BuildkitSession())
+	if err != nil {
+		return nil, err
+	}
+
+	bkSessionGroup, ok := buildkit.CurrentBuildkitSessionGroup(ctx)
+	if !ok {
+		return nil, fmt.Errorf("no buildkit session group found")
+	}
+
+	ref, err := src.Snapshot(ctx, bkSessionGroup)
+	if err != nil {
+		return nil, err
+	}
+
+	rootfsDir := &Directory{
+		Result: ref,
+	}
+	if container.FS != nil {
+		rootfsDir.Dir = container.FS.Self().Dir
+		if rootfsDir.Dir == "" {
+			return nil, fmt.Errorf("SetFSFromCanonicalRef got an empty dir")
+		} else if rootfsDir.Dir != "/" {
+			return nil, fmt.Errorf("SetFSFromCanonicalRef got %s as dir; however it will be lost", rootfsDir.Dir)
+		}
+		rootfsDir.Platform = container.FS.Self().Platform
+		rootfsDir.Services = container.FS.Self().Services
+	} else {
+		rootfsDir.Dir = "/"
+	}
+	updatedRootFS, err := UpdatedRootFS(ctx, rootfsDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update rootfs: %w", err)
+	}
+	container.FS = updatedRootFS
+	return container, nil
+}
+
+// FromCanonicalRefUpdateConfig is must be called outside of a dagop context, and is responsible for fetching the image config
+// and applying it to the container's metadata
+func (container *Container) FromCanonicalRefUpdateConfig(
+	ctx context.Context,
+	refName reference.Canonical,
+	// cfgBytes is optional, will be retrieved if not provided
+	cfgBytes []byte,
+) (*Container, error) {
+	query, err := CurrentQuery(ctx)
+	if err != nil {
+		return nil, err
+	}
 	bk, err := query.Buildkit(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
 	}
 
 	platform := container.Platform
-
 	refStr := refName.String()
 
 	// since this is an image ref w/ a digest, always check the local cache for the image
@@ -582,27 +673,10 @@ func (container *Container) FromCanonicalRef(
 		return nil, err
 	}
 
-	fsSt := llb.Image(
-		refStr,
-		llb.WithCustomNamef("pull %s", refStr),
-		resolveMode,
-		buildkit.WithTracePropagation(ctx),
-		buildkit.WithPassthrough(),
-	)
-
-	def, err := fsSt.Marshal(ctx, llb.Platform(platform.Spec()))
-	if err != nil {
-		return nil, err
-	}
-
 	container.Config = mergeImageConfig(container.Config, imgSpec.Config)
 	container.ImageRef = refStr
 	container.Platform = Platform(platforms.Normalize(imgSpec.Platform))
-	rootfsDir := NewDirectory(def.ToPB(), "/", container.Platform, container.Services)
-	container.FS, err = UpdatedRootFS(ctx, rootfsDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create rootfs directory: %w", err)
-	}
+
 	return container, nil
 }
 
@@ -1787,6 +1861,10 @@ func (container *Container) Evaluate(ctx context.Context) (*buildkit.Result, err
 	if err != nil {
 		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
 	}
+
+	ctx, span := Tracer(ctx).Start(ctx, "evaling", telemetry.Internal())
+	defer span.End()
+
 	return bk.Solve(ctx, bkgw.SolveRequest{
 		Evaluate:   true,
 		Definition: def.ToPB(),
@@ -1893,7 +1971,7 @@ func (container *Container) Stat(ctx context.Context, srv *dagql.Server, targetP
 func (container *Container) WithAnnotation(ctx context.Context, key, value string) (*Container, error) {
 	container = container.Clone()
 
-	container.Annotations = append(container.Annotations, ContainerAnnotation{
+	container.Annotations = append(container.Annotations, containerutil.ContainerAnnotation{
 		Key:   key,
 		Value: value,
 	})
@@ -1927,67 +2005,10 @@ func (container *Container) Publish(
 	forcedCompression ImageLayerCompression,
 	mediaTypes ImageMediaTypes,
 ) (string, error) {
-	if mediaTypes == "" {
-		// Modern registry implementations support oci types and docker daemons
-		// have been capable of pulling them since 2018:
-		// https://github.com/moby/moby/pull/37359
-		// So they are a safe default.
-		mediaTypes = OCIMediaTypes
-	}
-
-	opts := map[string]string{
-		string(exptypes.OptKeyName):     ref,
-		string(exptypes.OptKeyPush):     strconv.FormatBool(true),
-		string(exptypes.OptKeyOCITypes): strconv.FormatBool(mediaTypes == OCIMediaTypes),
-	}
-	if forcedCompression != "" {
-		opts[string(exptypes.OptKeyLayerCompression)] = strings.ToLower(string(forcedCompression))
-		opts[string(exptypes.OptKeyForceCompression)] = strconv.FormatBool(true)
-	}
-
-	inputByPlatform := map[string]buildkit.ContainerExport{}
-
-	variants := append([]*Container{container}, platformVariants...)
-	for _, variant := range variants {
-		if variant.FS == nil {
-			continue
-		}
-		st, err := variant.FSState()
-		if err != nil {
-			return "", err
-		}
-		platformSpec := variant.Platform.Spec()
-		def, err := st.Marshal(ctx, llb.Platform(platformSpec))
-		if err != nil {
-			return "", err
-		}
-
-		platformString := variant.Platform.Format()
-		if _, ok := inputByPlatform[platformString]; ok {
-			return "", fmt.Errorf("duplicate platform %q", platformString)
-		}
-		inputByPlatform[platformString] = buildkit.ContainerExport{
-			Definition: def.ToPB(),
-			Config:     variant.Config,
-		}
-
-		if len(variants) == 1 {
-			// single platform case
-			for _, annotation := range variant.Annotations {
-				opts[exptypes.AnnotationManifestKey(nil, annotation.Key)] = annotation.Value
-				opts[exptypes.AnnotationManifestDescriptorKey(nil, annotation.Key)] = annotation.Value
-			}
-		} else {
-			// multi platform case
-			for _, annotation := range variant.Annotations {
-				opts[exptypes.AnnotationManifestKey(&platformSpec, annotation.Key)] = annotation.Value
-				opts[exptypes.AnnotationManifestDescriptorKey(&platformSpec, annotation.Key)] = annotation.Value
-			}
-		}
-	}
-	if len(inputByPlatform) == 0 {
-		// Could also just ignore and do nothing, airing on side of error until proven otherwise.
-		return "", errors.New("no containers to export")
+	variants := filterEmptyContainers(append([]*Container{container}, platformVariants...))
+	inputByPlatform, err := getVariantRefs(ctx, variants)
+	if err != nil {
+		return "", err
 	}
 
 	query, err := CurrentQuery(ctx)
@@ -1999,7 +2020,7 @@ func (container *Container) Publish(
 		return "", fmt.Errorf("failed to get buildkit client: %w", err)
 	}
 
-	resp, err := bk.PublishContainerImage(ctx, inputByPlatform, opts)
+	resp, err := bk.PublishContainerImage(ctx, inputByPlatform, ref, useOCIMediaTypes(mediaTypes), string(forcedCompression))
 	if err != nil {
 		return "", err
 	}
@@ -2027,6 +2048,73 @@ func (container *Container) Publish(
 	return ref, nil
 }
 
+func (container *Container) AsTarball(
+	ctx context.Context,
+	platformVariants []*Container,
+	forcedCompression ImageLayerCompression,
+	mediaTypes ImageMediaTypes,
+	filePath string,
+) (f *File, rerr error) {
+	query, err := CurrentQuery(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	bk, err := query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+	engineHostPlatform := query.Platform()
+
+	if mediaTypes == "" {
+		mediaTypes = OCIMediaTypes
+	}
+
+	variants := filterEmptyContainers(append([]*Container{container}, platformVariants...))
+	inputByPlatform, err := getVariantRefs(ctx, variants)
+	if err != nil {
+		return nil, err
+	}
+
+	bkSessionGroup, ok := buildkit.CurrentBuildkitSessionGroup(ctx)
+	if !ok {
+		return nil, fmt.Errorf("no buildkit session group found")
+	}
+
+	bkref, err := query.BuildkitCache().New(ctx, nil, bkSessionGroup,
+		bkcache.CachePolicyRetain,
+		bkcache.WithRecordType(bkclient.UsageRecordTypeRegular),
+		bkcache.WithDescription("dagop.fs container.asTarball "+filePath),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if rerr != nil && bkref != nil {
+			bkref.Release(context.WithoutCancel(ctx))
+		}
+	}()
+	err = MountRef(ctx, bkref, bkSessionGroup, func(out string, _ *mount.Mount) error {
+		err = bk.ContainerImageToTarball(ctx, engineHostPlatform.Spec(), filepath.Join(out, filePath), inputByPlatform, useOCIMediaTypes(mediaTypes), string(forcedCompression))
+		if err != nil {
+			return fmt.Errorf("container image to tarball file conversion failed: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("container image to tarball file conversion failed: %w", err)
+	}
+
+	f = NewFile(nil, filePath, query.Platform(), nil)
+	snap, err := bkref.Commit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bkref = nil
+	f.Result = snap
+	return f, nil
+}
+
 type ExportOpts struct {
 	Dest              string
 	PlatformVariants  []*Container
@@ -2036,10 +2124,79 @@ type ExportOpts struct {
 	LeaseID           string
 }
 
-func (container *Container) Export(
-	ctx context.Context,
-	opts ExportOpts,
-) (*specs.Descriptor, error) {
+func useOCIMediaTypes(mediaTypes ImageMediaTypes) bool {
+	if mediaTypes == "" {
+		// Modern registry implementations support oci types and docker daemons
+		// have been capable of pulling them since 2018:
+		// https://github.com/moby/moby/pull/37359
+		// So they are a safe default.
+		mediaTypes = OCIMediaTypes
+	}
+	return mediaTypes == OCIMediaTypes
+}
+
+func filterEmptyContainers(containers []*Container) []*Container {
+	var l []*Container
+	for _, c := range containers {
+		if c.FS == nil {
+			continue
+		}
+		rootFS := c.FS.Self()
+		if rootFS == nil {
+			continue
+		}
+		l = append(l, c)
+	}
+	return l
+}
+
+func getVariantRefs(ctx context.Context, variants []*Container) (map[string]buildkit.ContainerExport, error) {
+	inputByPlatform := map[string]buildkit.ContainerExport{}
+	var eg errgroup.Group
+	var mu sync.Mutex
+	for _, variant := range variants {
+		if variant.FS == nil {
+			continue
+		}
+		rootFS := variant.FS.Self()
+		if rootFS == nil {
+			continue
+		}
+
+		platformString := variant.Platform.Format()
+		if _, ok := inputByPlatform[platformString]; ok {
+			return nil, fmt.Errorf("duplicate platform %q", platformString)
+		}
+
+		eg.Go(func() error {
+			fsRef, err := getRefOrEvaluate(ctx, rootFS)
+			if err != nil {
+				return err
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			inputByPlatform[platformString] = buildkit.ContainerExport{
+				Ref:         fsRef,
+				Config:      variant.Config,
+				Annotations: variant.Annotations,
+			}
+			return nil
+		})
+	}
+	err := eg.Wait()
+	if err != nil {
+		return nil, err
+	}
+	if len(inputByPlatform) == 0 {
+		// Could also just ignore and do nothing, airing on side of error until proven otherwise.
+		return nil, errors.New("no containers to export")
+	}
+	return inputByPlatform, nil
+}
+
+func (container *Container) Export(ctx context.Context, opts ExportOpts) (*specs.Descriptor, error) {
 	query, err := CurrentQuery(ctx)
 	if err != nil {
 		return nil, err
@@ -2049,80 +2206,17 @@ func (container *Container) Export(
 		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
 	}
 
-	mediaTypes := opts.MediaTypes
-	if mediaTypes == "" {
-		// Modern registry implementations support oci types and docker daemons
-		// have been capable of pulling them since 2018:
-		// https://github.com/moby/moby/pull/37359
-		// So they are a safe default.
-		mediaTypes = OCIMediaTypes
-	}
-
-	bkopts := map[string]string{
-		"tar":                           strconv.FormatBool(opts.Tar),
-		string(exptypes.OptKeyOCITypes): strconv.FormatBool(mediaTypes == OCIMediaTypes),
-	}
-
-	if !opts.Tar {
-		bkopts["store"] = "export"
-		bkopts["lease"] = opts.LeaseID
-	}
-
-	if opts.ForcedCompression != "" {
-		bkopts[string(exptypes.OptKeyLayerCompression)] = strings.ToLower(string(opts.ForcedCompression))
-		bkopts[string(exptypes.OptKeyForceCompression)] = strconv.FormatBool(true)
-	}
-
-	inputByPlatform := map[string]buildkit.ContainerExport{}
-
-	variants := append([]*Container{container}, opts.PlatformVariants...)
-	for _, variant := range variants {
-		if variant.FS == nil {
-			continue
-		}
-		st, err := variant.FSState()
-		if err != nil {
-			return nil, err
-		}
-
-		platformSpec := variant.Platform.Spec()
-		def, err := st.Marshal(ctx, llb.Platform(platformSpec))
-		if err != nil {
-			return nil, err
-		}
-
-		platformString := variant.Platform.Format()
-		if _, ok := inputByPlatform[platformString]; ok {
-			return nil, fmt.Errorf("duplicate platform %q", platformString)
-		}
-		inputByPlatform[platformString] = buildkit.ContainerExport{
-			Definition: def.ToPB(),
-			Config:     variant.Config,
-		}
-
-		if len(variants) == 1 {
-			// single platform case
-			for _, annotation := range variant.Annotations {
-				bkopts[exptypes.AnnotationManifestKey(nil, annotation.Key)] = annotation.Value
-				bkopts[exptypes.AnnotationManifestDescriptorKey(nil, annotation.Key)] = annotation.Value
-			}
-		} else {
-			// multi platform case
-			for _, annotation := range variant.Annotations {
-				bkopts[exptypes.AnnotationManifestKey(&platformSpec, annotation.Key)] = annotation.Value
-				bkopts[exptypes.AnnotationManifestDescriptorKey(&platformSpec, annotation.Key)] = annotation.Value
-			}
-		}
-	}
-	if len(inputByPlatform) == 0 {
-		// Could also just ignore and do nothing, airing on side of error until proven otherwise.
-		return nil, errors.New("no containers to export")
-	}
-
-	resp, err := bk.ExportContainerImage(ctx, inputByPlatform, opts.Dest, bkopts)
+	variants := filterEmptyContainers(append([]*Container{container}, opts.PlatformVariants...))
+	inputByPlatform, err := getVariantRefs(ctx, variants)
 	if err != nil {
 		return nil, err
 	}
+
+	resp, err := bk.ExportContainerImage(ctx, opts.Dest, inputByPlatform, string(opts.ForcedCompression), opts.Tar, opts.LeaseID, useOCIMediaTypes(opts.MediaTypes))
+	if err != nil {
+		return nil, err
+	}
+
 	encodedDesc, ok := resp[exptypes.ExporterImageDescriptorKey]
 	if !ok {
 		return nil, fmt.Errorf("exporter response missing %s", exptypes.ExporterImageDescriptorKey)

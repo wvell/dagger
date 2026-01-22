@@ -24,7 +24,6 @@ import (
 	"github.com/dagger/dagger/internal/buildkit/snapshot"
 	"github.com/dagger/dagger/internal/buildkit/solver/pb"
 	fscopy "github.com/dagger/dagger/internal/fsutil/copy"
-	fstypes "github.com/dagger/dagger/internal/fsutil/types"
 	"github.com/dagger/dagger/util/patternmatcher"
 	"github.com/dustin/go-humanize"
 	"github.com/vektah/gqlparser/v2/ast"
@@ -163,6 +162,10 @@ func (dir *Directory) StateWithSourcePath() (llb.State, error) {
 		return dirSt, nil
 	}
 
+	if dir.Dir == "" {
+		return llb.State{}, fmt.Errorf("got empty dir path, which shouldnt happen")
+	}
+
 	return llb.Scratch().File(
 		llb.Copy(dirSt, dir.Dir, ".", &llb.CopyInfo{
 			CopyDirContentsOnly: true,
@@ -219,42 +222,6 @@ func (dir *Directory) Digest(ctx context.Context) (string, error) {
 	}
 
 	return digest.String(), nil
-}
-
-func (dir *Directory) StatLLB(ctx context.Context, bk *buildkit.Client, targetPath string) (*fstypes.Stat, error) {
-	src := path.Join(dir.Dir, targetPath)
-
-	res, err := bk.Solve(ctx, bkgw.SolveRequest{
-		Definition: dir.LLB,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to solve: %w", err)
-	}
-
-	ref, err := res.SingleRef()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get single ref: %w", err)
-	}
-	// empty directory, i.e. llb.Scratch()
-	if ref == nil {
-		if clean := path.Clean(src); clean == "." || clean == "/" {
-			// fake out a reasonable response
-			return &fstypes.Stat{
-				Path: src,
-				Mode: uint32(fs.ModeDir),
-			}, nil
-		}
-
-		return nil, fmt.Errorf("%s: %w", targetPath, syscall.ENOENT)
-	}
-
-	st, err := ref.StatFile(ctx, bkgw.StatRequest{
-		Path: src,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return st, nil
 }
 
 func (dir *Directory) Entries(ctx context.Context, src string) ([]string, error) {
@@ -705,29 +672,36 @@ func (dir *Directory) File(ctx context.Context, file string) (*File, error) {
 	}, nil
 }
 
-func (dir *Directory) FileLLB(ctx context.Context, file string) (*File, error) {
-	query, err := CurrentQuery(ctx)
-	if err != nil {
-		return nil, err
-	}
-	bk, err := query.Buildkit(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
-	}
-
-	err = validateFileName(file)
+func (dir *Directory) FileLLB(ctx context.Context, parent dagql.ObjectResult[*Directory], file string) (*File, error) {
+	err := validateFileName(file)
 	if err != nil {
 		return nil, err
 	}
 
-	// check that the file actually exists so the user gets an error earlier
-	// rather than when the file is used
-	info, err := dir.StatLLB(ctx, bk, file)
+	srv, err := CurrentDagqlServer(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get dagql server: %w", err)
+	}
+
+	internalSpanCtx, internalSpan := Tracer(ctx).Start(ctx, fmt.Sprintf("file %s", file),
+		telemetry.Internal(),
+	)
+	defer telemetry.EndWithCause(internalSpan, nil)
+
+	var fileStat *Stat
+	err = srv.Select(internalSpanCtx, parent, &fileStat,
+		dagql.Selector{
+			Field: "stat",
+			Args: []dagql.NamedInput{
+				{Name: "path", Value: dagql.String(file)},
+			},
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	if info.IsDir() {
+	if fileStat.IsDir() {
 		return nil, notAFileError{fmt.Errorf("path %s is a directory, not a file", file)}
 	}
 
@@ -1253,7 +1227,7 @@ func (dir *Directory) WithNewDirectory(ctx context.Context, dest string, permiss
 		if err != nil {
 			return err
 		}
-		return RestoreErrPath(os.MkdirAll(resolvedDir, permissions), dest)
+		return TrimErrPathPrefix(os.MkdirAll(resolvedDir, permissions), root)
 	}, withSavedSnapshot("withNewDirectory %s", dest))
 }
 
@@ -1584,29 +1558,29 @@ func (*Stat) TypeDescription() string {
 	return "A file or directory status object."
 }
 
+func (s *Stat) IsDir() bool {
+	return s != nil && s.FileType == FileTypeDirectory
+}
+
 func (s Stat) Clone() *Stat {
 	cp := s
 	return &cp
 }
 
 func (dir *Directory) Stat(ctx context.Context, srv *dagql.Server, targetPath string, doNotFollowSymlinks bool) (*Stat, error) {
-	res, err := dir.Evaluate(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	ref, err := res.SingleRef()
-	if err != nil {
-		return nil, err
-	}
-	if ref == nil {
+	if targetPath == "" {
 		return nil, &os.PathError{Op: "stat", Path: targetPath, Err: syscall.ENOENT}
 	}
 
-	immutableRef, err := ref.CacheRef(ctx)
+	immutableRef, err := getRefOrEvaluate(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
+	if immutableRef == nil {
+		return nil, &os.PathError{Op: "stat", Path: targetPath, Err: syscall.ENOENT}
+	}
+
+	bkSessionGroup := requiresBuildkitSessionGroup(ctx)
 
 	osStatFunc := os.Stat
 	rootPathFunc := containerdfs.RootPath
@@ -1618,13 +1592,13 @@ func (dir *Directory) Stat(ctx context.Context, srv *dagql.Server, targetPath st
 	}
 
 	var fileInfo os.FileInfo
-	err = MountRef(ctx, immutableRef, nil, func(root string, _ *mount.Mount) error {
+	err = MountRef(ctx, immutableRef, bkSessionGroup, func(root string, _ *mount.Mount) error {
 		resolvedPath, err := rootPathFunc(root, path.Join(dir.Dir, targetPath))
 		if err != nil {
 			return err
 		}
 		fileInfo, err = osStatFunc(resolvedPath)
-		return RestoreErrPath(err, targetPath)
+		return TrimErrPathPrefix(err, root)
 	})
 	if err != nil {
 		return nil, err
@@ -1879,4 +1853,16 @@ func (ft *FileType) UnmarshalJSON(payload []byte) error {
 	}
 	*ft = FileType(str)
 	return nil
+}
+
+func FileModeToFileType(m fs.FileMode) FileType {
+	if m.IsDir() {
+		return FileTypeDirectory
+	} else if m.IsRegular() {
+		return FileTypeRegular
+	} else if m&fs.ModeSymlink != 0 {
+		return FileTypeSymlink
+	} else {
+		return FileTypeUnknown
+	}
 }
